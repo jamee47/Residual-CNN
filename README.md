@@ -155,7 +155,7 @@ plots/            # produced by train.py
 
 Residual-CNN is a **two-branch fusion network**:
 
-![Residual-CNN architecture overview](./architecture_overview.svg)
+![Residual-CNN architecture overview](./doc/architecture_overview.svg)
 
 ### 1. Pilot branch
 
@@ -169,7 +169,7 @@ Residual-CNN is a **two-branch fusion network**:
 
   The internal structure of each residual block (`resblock{i}_conv1` → `resblock{i}_bn1` → `resblock{i}_relu1` → `resblock{i}_conv2` → `resblock{i}_bn2` → `Add` with the skip path → `resblock{i}_relu2`) is shown below:
 
-  ![Residual block internal structure](./resblock_detail.svg)
+  ![Residual block internal structure](./doc/resblock_detail.svg)
 
 - **Global pooling:** both `GlobalAveragePooling1D` and `GlobalMaxPooling1D` are computed and concatenated — average pooling captures the overall pilot statistics (useful for noise-variance-like cues), max pooling captures salient outlier pilot symbols.
 - The mask channel ensures padded positions (for MODCODs with `Np < MAX_NP`) contribute `0` to the re/im channels, and the network can learn (via the mask channel itself) to discount those positions in the pooled representation.
