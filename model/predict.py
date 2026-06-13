@@ -85,6 +85,15 @@ def _prep_from_df(df, artifacts):
 
     pilots = np.stack([re_s, im_s, pilot_mask], axis=-1).astype(np.float32)
 
+    # --- Mirror feature engineering from preprocess.py ---
+    # Circular encoding of phase angle
+    df = df.copy()  # avoid mutating the caller's DataFrame
+    df["sin_phi"] = np.sin(df["phi_rad"].values)
+    df["cos_phi"] = np.cos(df["phi_rad"].values)
+    # Log-transform skewed power/variance features
+    df["Ap_linear"] = np.log1p(df["Ap_linear"].values.clip(0))
+    df["nvar_pilot"] = np.log1p(df["nvar_pilot"].values.clip(0))
+
     # Side features
     side = df[SIDE_FEATURES].values.astype(np.float32)
     labels = df["modcod_label"].values
@@ -100,24 +109,51 @@ def _prep_from_df(df, artifacts):
     return {"pilots": pilots, "side": side_s}
 
 
-def predict_from_arrays(x, artifacts):
-    """x: dict with 'pilots' [N, MAX_NP, 3] and 'side' [N, n_side] (already scaled)."""
-    preds_scaled = artifacts["model"].predict(x, verbose=0)
+def predict_from_arrays(x, artifacts, batch_size=1024):
+    """x: dict with 'pilots' [N, MAX_NP, 3] and 'side' [N, n_side] (already scaled).
+    batch_size is passed to model.predict to avoid OOM on large inputs.
+    """
+    preds_scaled = artifacts["model"].predict(x, batch_size=batch_size, verbose=0)
     preds = artifacts["target_scaler"].inverse_transform(preds_scaled)
     return preds  # [N, 2] -> (hk_real, hk_imag)
 
 
-def predict_from_csv(csv_path, artifacts):
+def predict_from_csv(csv_path, artifacts, batch_size=1024):
     df = pd.read_csv(csv_path)
     x = _prep_from_df(df, artifacts)
-    preds = predict_from_arrays(x, artifacts)
-    out = df[["sample_id", "modcod", "modcod_label"]].copy() \
-        if "sample_id" in df.columns else pd.DataFrame()
+    preds = predict_from_arrays(x, artifacts, batch_size=batch_size)
+
+    # Build output DataFrame
+    if "sample_id" in df.columns:
+        out = df[["sample_id", "modcod", "modcod_label"]].copy()
+    else:
+        out = pd.DataFrame({"row_idx": np.arange(len(preds))})
+
     out["hk_real_pred"] = preds[:, 0]
     out["hk_imag_pred"] = preds[:, 1]
+
     if "htrue_real" in df.columns:
         out["hk_real_true"] = df["htrue_real"].values
         out["hk_imag_true"] = df["htrue_imag"].values
+        # D2: print evaluation metrics when ground truth is available
+        err_real = preds[:, 0] - df["htrue_real"].values
+        err_imag = preds[:, 1] - df["htrue_imag"].values
+        mae_real  = np.mean(np.abs(err_real))
+        mae_imag  = np.mean(np.abs(err_imag))
+        rmse_real = np.sqrt(np.mean(err_real ** 2))
+        rmse_imag = np.sqrt(np.mean(err_imag ** 2))
+        print("\n[EVAL] Metrics vs ground truth:")
+        print(f"  MAE   hk_real = {mae_real:.6f}   hk_imag = {mae_imag:.6f}")
+        print(f"  RMSE  hk_real = {rmse_real:.6f}   hk_imag = {rmse_imag:.6f}")
+        # Per-MODCOD breakdown if label column is present
+        if "modcod_label" in df.columns:
+            print("\n[EVAL] Per-MODCOD RMSE:")
+            for label, grp in out.groupby("modcod_label"):
+                e_r = grp["hk_real_pred"].values - grp["hk_real_true"].values
+                e_i = grp["hk_imag_pred"].values - grp["hk_imag_true"].values
+                rmse = np.sqrt(np.mean(e_r**2 + e_i**2))
+                print(f"  {label:<20} RMSE = {rmse:.6f}")
+
     return out
 
 

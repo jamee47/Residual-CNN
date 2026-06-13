@@ -27,19 +27,30 @@ from tensorflow.keras import layers, models, regularizers
 
 
 def residual_block(x, filters, kernel_size=3, dilation_rate=1, l2=1e-5, name=None):
-    """1D conv residual block with pre-activation, BN, and skip connection."""
+    """
+    1D conv residual block with BN, skip connection, and mixed dilation.
+
+    conv1 is always undilated (dilation_rate=1) to preserve local context;
+    conv2 uses the requested dilation_rate to widen the receptive field.
+    This avoids the "gridding" artefact where purely dilated stacks have
+    blind spots between sampled positions.
+    """
     shortcut = x
 
+    # First conv: always local (dilation=1) to anchor to immediate neighbours
     y = layers.Conv1D(filters, kernel_size, padding="same",
-                       dilation_rate=dilation_rate,
+                       dilation_rate=1,
                        kernel_regularizer=regularizers.l2(l2),
+                       kernel_initializer="he_normal",
                        name=None if name is None else f"{name}_conv1")(x)
     y = layers.BatchNormalization(name=None if name is None else f"{name}_bn1")(y)
     y = layers.ReLU(name=None if name is None else f"{name}_relu1")(y)
 
+    # Second conv: dilated to progressively widen receptive field
     y = layers.Conv1D(filters, kernel_size, padding="same",
                        dilation_rate=dilation_rate,
                        kernel_regularizer=regularizers.l2(l2),
+                       kernel_initializer="he_normal",
                        name=None if name is None else f"{name}_conv2")(y)
     y = layers.BatchNormalization(name=None if name is None else f"{name}_bn2")(y)
 
@@ -47,6 +58,7 @@ def residual_block(x, filters, kernel_size=3, dilation_rate=1, l2=1e-5, name=Non
     if shortcut.shape[-1] != filters:
         shortcut = layers.Conv1D(filters, 1, padding="same",
                                   kernel_regularizer=regularizers.l2(l2),
+                                  kernel_initializer="he_normal",
                                   name=None if name is None else f"{name}_proj")(shortcut)
 
     out = layers.Add(name=None if name is None else f"{name}_add")([shortcut, y])
@@ -84,6 +96,7 @@ def build_model(max_np, n_side_features,
     # ---- Pilot CNN-residual branch ----
     x = layers.Conv1D(cnn_filters[0], 7, padding="same",
                        kernel_regularizer=regularizers.l2(l2),
+                       kernel_initializer="he_normal",
                        name="stem_conv")(pilot_input)
     x = layers.BatchNormalization(name="stem_bn")(x)
     x = layers.ReLU(name="stem_relu")(x)
@@ -99,10 +112,13 @@ def build_model(max_np, n_side_features,
 
     # ---- Side-info MLP branch ----
     s = layers.Dense(64, activation="relu",
-                      kernel_regularizer=regularizers.l2(l2), name="side_dense1")(side_input)
+                      kernel_regularizer=regularizers.l2(l2),
+                      kernel_initializer="he_normal", name="side_dense1")(side_input)
     s = layers.BatchNormalization(name="side_bn1")(s)
     s = layers.Dense(32, activation="relu",
-                      kernel_regularizer=regularizers.l2(l2), name="side_dense2")(s)
+                      kernel_regularizer=regularizers.l2(l2),
+                      kernel_initializer="he_normal", name="side_dense2")(s)
+    s = layers.BatchNormalization(name="side_bn2")(s)  # symmetry with side_dense1
 
     # ---- Fusion + regression head ----
     merged = layers.Concatenate(name="fusion_concat")([pilot_features, s])
@@ -111,6 +127,7 @@ def build_model(max_np, n_side_features,
     for i, u in enumerate(dense_units):
         h = layers.Dense(u, activation="relu",
                           kernel_regularizer=regularizers.l2(l2),
+                          kernel_initializer="he_normal",
                           name=f"head_dense{i+1}")(h)
         h = layers.Dropout(dropout_rate, name=f"head_dropout{i+1}")(h)
 

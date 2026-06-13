@@ -27,6 +27,7 @@ import os
 import glob
 import json
 import argparse
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -42,12 +43,19 @@ META_COLS = [
     "htrue_real", "htrue_imag", "htrue_mag", "htrue_phase_rad",
 ]
 
-# Scalar side-info features fed to the dense branch of the model
+# Scalar side-info features fed to the dense branch of the model.
+# phi_rad is a circular feature encoded as (sin, cos) to avoid wrap-around
+# discontinuity at ±π. Ap_linear and nvar_pilot are log-transformed because
+# they are approximately log-normally distributed (power / variance ratios).
 SIDE_FEATURES = [
     "modOrder", "codeRate_num", "codeRate_den", "plFrameSize",
     "Np_actual", "numPilotBlks", "esno_nom_dB", "rainAtt_dB",
-    "p_exceedance", "snr_eff_dB", "snr_awgn_dB", "nvar_pilot",
-    "pilotScale", "Ap_linear", "phi_rad", "b_gain", "b_max",
+    "p_exceedance", "snr_eff_dB", "snr_awgn_dB",
+    "nvar_pilot",          # will be log1p-transformed in _load_single_csv
+    "pilotScale",
+    "Ap_linear",           # will be log1p-transformed in _load_single_csv
+    "sin_phi", "cos_phi",  # derived from phi_rad (circular encoding)
+    "b_gain", "b_max",
 ]
 
 TARGET_COLS = ["htrue_real", "htrue_imag"]
@@ -69,6 +77,15 @@ def _load_single_csv(path):
     pilot_re = df[[f"pilot_re_{i+1}" for i in range(np_pilots)]].values
     pilot_im = df[[f"pilot_im_{i+1}" for i in range(np_pilots)]].values
     pilot_mask = df[[f"pilot_mask_{i+1}" for i in range(np_pilots)]].values
+
+    # --- Feature engineering before extracting SIDE_FEATURES ---
+    # B5: circular encoding of phase angle (avoids ±π wrap-around discontinuity)
+    df["sin_phi"] = np.sin(df["phi_rad"].values)
+    df["cos_phi"] = np.cos(df["phi_rad"].values)
+
+    # B6/B7: log-transform skewed power/variance features
+    df["Ap_linear"] = np.log1p(df["Ap_linear"].values.clip(0))   # linear rain atten.
+    df["nvar_pilot"] = np.log1p(df["nvar_pilot"].values.clip(0)) # noise variance
 
     side = df[SIDE_FEATURES].values.astype(np.float32)
     targets = df[TARGET_COLS].values.astype(np.float32)
@@ -146,13 +163,20 @@ def build_dataset(data_dir, out_dir, test_size=0.15, val_size=0.15, seed=42):
     # Stack pilots into [N, MAX_NP, 3] (re, im, mask)
     pilots = np.stack([pilot_re, pilot_im, pilot_mask], axis=-1)
 
-    # Train / val / test split
+    # Train / val / test split — stratified by MODCOD label so every split
+    # sees all MODCODs in proportional representation (B2).
     idx = np.arange(n_samples)
-    idx_train, idx_temp = train_test_split(idx, test_size=(test_size + val_size),
-                                            random_state=seed, shuffle=True)
+    idx_train, idx_temp = train_test_split(
+        idx, test_size=(test_size + val_size),
+        random_state=seed, shuffle=True,
+        stratify=label_idx,
+    )
     rel_test = test_size / (test_size + val_size)
-    idx_val, idx_test = train_test_split(idx_temp, test_size=rel_test,
-                                          random_state=seed, shuffle=True)
+    idx_val, idx_test = train_test_split(
+        idx_temp, test_size=rel_test,
+        random_state=seed, shuffle=True,
+        stratify=label_idx[idx_temp],
+    )
 
     # Standardize side features (fit on train only); pilots are already
     # normalized by pilotScale in the generator, but we still standardize
@@ -169,11 +193,16 @@ def build_dataset(data_dir, out_dir, test_size=0.15, val_size=0.15, seed=42):
         re = p[..., 0]
         im = p[..., 1]
         mask = p[..., 2]
+        if fit:
+            # B1: fit scalers ONLY on unmasked (real) pilot entries to avoid
+            # the padded-zero bias on the mean and standard deviation.
+            valid = mask.astype(bool)              # [N, MAX_NP]
+            re_valid = re[valid].reshape(-1, 1)
+            im_valid = im[valid].reshape(-1, 1)
+            pilot_scaler_re.fit(re_valid)
+            pilot_scaler_im.fit(im_valid)
         flat_re = re.reshape(-1, 1)
         flat_im = im.reshape(-1, 1)
-        if fit:
-            pilot_scaler_re.fit(flat_re)
-            pilot_scaler_im.fit(flat_im)
         re_s = pilot_scaler_re.transform(flat_re).reshape(re.shape)
         im_s = pilot_scaler_im.transform(flat_im).reshape(im.shape)
         # zero-out padded entries after scaling
@@ -226,7 +255,6 @@ def build_dataset(data_dir, out_dir, test_size=0.15, val_size=0.15, seed=42):
         json.dump(meta, f, indent=2)
 
     # Save scalers
-    import joblib
     joblib.dump(side_scaler, os.path.join(out_dir, "side_scaler.pkl"))
     joblib.dump(pilot_scaler_re, os.path.join(out_dir, "pilot_scaler_re.pkl"))
     joblib.dump(pilot_scaler_im, os.path.join(out_dir, "pilot_scaler_im.pkl"))

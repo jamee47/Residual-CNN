@@ -21,8 +21,12 @@ Usage:
 """
 
 import os
+import sys
 import json
+import socket
+import platform
 import argparse
+import datetime
 import numpy as np
 import tensorflow as tf
 import matplotlib
@@ -98,6 +102,152 @@ class PlotHistoryCallback(tf.keras.callbacks.Callback):
         plt.close(fig)
 
 
+
+class TrainingSessionLogger(tf.keras.callbacks.Callback):
+    """
+    Writes a rich session record to {plot_dir}/session_log.json
+    (append-only list of runs) and a human-readable summary to
+    {plot_dir}/session_summary.txt after training finishes.
+
+    Each record captures:
+      - Unique session ID (ISO timestamp)
+      - Start / end time and total duration
+      - All CLI hyperparameters
+      - Hardware (GPU names or 'CPU')
+      - initial_epoch, epochs actually trained
+      - Final train + val metrics (loss, mae, rmse)
+      - Best epoch index and its val_loss
+      - Whether EarlyStopping fired
+      - Path of the saved model that will be produced
+    """
+
+    def __init__(self, plot_dir, args, initial_epoch, ckpt_dir):
+        super().__init__()
+        self.plot_dir = plot_dir
+        self.args = vars(args)
+        self.initial_epoch = initial_epoch
+        self.ckpt_dir = ckpt_dir
+        self.session_id = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        self._start_time = None
+        self._epoch_logs = []          # one dict per epoch
+        self._stopped_early = False
+
+    # ------------------------------------------------------------------ #
+    def on_train_begin(self, logs=None):
+        self._start_time = datetime.datetime.now()
+        gpus = tf.config.list_physical_devices("GPU")
+        self._hw = [g.name for g in gpus] if gpus else ["CPU"]
+
+    def on_epoch_end(self, epoch, logs=None):
+        self._epoch_logs.append({"epoch": epoch, **(logs or {})})
+
+    def on_train_end(self, logs=None):
+        end_time = datetime.datetime.now()
+        duration = (end_time - self._start_time).total_seconds()
+
+        # Detect early stopping: if we ended before --epochs
+        epochs_trained = len(self._epoch_logs)
+        max_epochs = self.args.get("epochs", 0)
+        self._stopped_early = (epochs_trained < (max_epochs - self.initial_epoch))
+
+        # Best epoch by val_loss
+        best_epoch = None
+        best_val_loss = None
+        for rec in self._epoch_logs:
+            if "val_loss" in rec:
+                if best_val_loss is None or rec["val_loss"] < best_val_loss:
+                    best_val_loss = rec["val_loss"]
+                    best_epoch = rec["epoch"]
+
+        # Final metrics (last epoch)
+        final_metrics = {}
+        if self._epoch_logs:
+            last = self._epoch_logs[-1]
+            final_metrics = {k: float(v) for k, v in last.items() if k != "epoch"}
+
+        record = {
+            "session_id": self.session_id,
+            "start_time": self._start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "duration_seconds": round(duration, 2),
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python_version": sys.version,
+            "hardware": self._hw,
+            "hyperparameters": self.args,
+            "initial_epoch": self.initial_epoch,
+            "epochs_trained": epochs_trained,
+            "final_epoch": (self.initial_epoch + epochs_trained - 1)
+                            if epochs_trained > 0 else self.initial_epoch,
+            "early_stopped": self._stopped_early,
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss) if best_val_loss is not None else None,
+            "final_metrics": final_metrics,
+            "final_model_path": os.path.join(self.ckpt_dir, "final_model.keras"),
+        }
+
+        self._write_json_log(record)
+        self._write_text_summary(record)
+        print(f"[SESSION LOG] Session {self.session_id} recorded → "
+              f"{os.path.join(self.plot_dir, 'session_log.json')}")
+
+    # ------------------------------------------------------------------ #
+    def _write_json_log(self, record):
+        log_path = os.path.join(self.plot_dir, "session_log.json")
+        sessions = []
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r") as f:
+                    sessions = json.load(f)
+                if not isinstance(sessions, list):
+                    sessions = [sessions]   # migrate old single-record files
+            except (json.JSONDecodeError, ValueError):
+                sessions = []              # corrupted file — start fresh
+        sessions.append(record)
+        with open(log_path, "w") as f:
+            json.dump(sessions, f, indent=2)
+
+    def _write_text_summary(self, record):
+        summary_path = os.path.join(self.plot_dir, "session_summary.txt")
+        sep = "=" * 60
+        lines = [
+            sep,
+            f"Session ID  : {record['session_id']}",
+            f"Start       : {record['start_time']}",
+            f"End         : {record['end_time']}",
+            f"Duration    : {record['duration_seconds']:.1f} s  "
+            f"({record['duration_seconds']/60:.1f} min)",
+            f"Host        : {record['hostname']}",
+            f"Hardware    : {', '.join(record['hardware'])}",
+            "",
+            "Hyperparameters:",
+        ]
+        for k, v in record["hyperparameters"].items():
+            lines.append(f"  {k:<15} = {v}")
+        lines += [
+            "",
+            f"Initial epoch   : {record['initial_epoch']}",
+            f"Epochs trained  : {record['epochs_trained']}",
+            f"Final epoch     : {record['final_epoch']}",
+            f"Early stopped   : {record['early_stopped']}",
+            f"Best epoch      : {record['best_epoch']}",
+            f"Best val_loss   : {record['best_val_loss']}",
+            "",
+            "Final metrics:",
+        ]
+        for k, v in record["final_metrics"].items():
+            lines.append(f"  {k:<25} = {v:.6f}")
+        lines += [
+            "",
+            f"Model saved to  : {record['final_model_path']}",
+            sep,
+            "",
+        ]
+        # Append so previous runs are preserved in the same file
+        with open(summary_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+
+
 def main(args):
     configure_gpu()
 
@@ -139,7 +289,11 @@ def main(args):
         model = build_model(max_np=max_np, n_side_features=n_side)
         model = compile_model(model, learning_rate=args.lr)
 
-    model.summary()
+    # Save model summary to a text file so it survives across runs
+    summary_path = os.path.join(args.plot_dir, "model_summary.txt")
+    with open(summary_path, "w") as sf:
+        model.summary(print_fn=lambda line: sf.write(line + "\n"))
+    model.summary()  # also print to stdout as before
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
@@ -154,6 +308,12 @@ def main(args):
         PlotHistoryCallback(args.plot_dir, history_path),
         tf.keras.callbacks.CSVLogger(
             os.path.join(args.plot_dir, "training_log.csv"), append=True),
+        TrainingSessionLogger(
+            plot_dir=args.plot_dir,
+            args=args,
+            initial_epoch=initial_epoch,
+            ckpt_dir=args.ckpt_dir,
+        ),
     ]
 
     model.fit(
